@@ -1,0 +1,134 @@
+name: "在线代码开发"
+version: "1.0"
+
+context:
+  work_dir: "./project"
+  model: "claude-sonnet-4-6"
+
+steps:
+
+  # ── 需求分析 ──
+  - id: requirement_analysis
+    type: llm
+    description: "需求分析，产出规格文档"
+    skill_dir: "./examples/skills/requirement_analysis"
+    user_prompt: |
+      请分析以下需求，产出规格文档：
+      {{ input.task }}
+    output:
+      save_to: "{{ config.work_dir }}/specs/analysis.md"
+    timeout: 300
+    retry: 2
+
+  # ── 人机确认 ──
+  - id: human_review
+    type: approval
+    description: "确认需求分析结果"
+    depends_on: [requirement_analysis]
+    message: |
+      请检查需求分析结果。
+
+      文件: {{ config.work_dir }}/specs/analysis.md
+    show_file: "{{ config.work_dir }}/specs/analysis.md"
+    choices:
+      - label: "通过，开始开发"
+      - label: "驳回，重新分析"
+        next: requirement_analysis
+
+  # ── 代码开发 ──
+  - id: code_development
+    type: llm
+    description: "按规格实现代码"
+    depends_on: [human_review]
+    skill_dir: "./examples/skills/code_development"
+    user_prompt: |
+      根据以下规格实现代码：
+
+      {{ steps.requirement_analysis.output }}
+    output:
+      save_to: "{{ config.work_dir }}/src/"
+    timeout: 600
+    retry: 1
+
+  # ── 编译检查 ──
+  - id: compile_check
+    type: script
+    description: "编译验证"
+    depends_on: [code_development]
+    command: "cd {{ config.work_dir }} && npm run build 2>&1"
+    on_failure:
+      action: goto
+      target: compile_failure_analysis
+
+  # ── 编译失败分析 ──
+  - id: compile_failure_analysis
+    type: llm
+    description: "分析编译失败原因"
+    skill_dir: "./examples/skills/failure_analysis"
+    user_prompt: |
+      编译失败，错误信息：
+
+      {{ steps.compile_check.stderr }}
+
+      请分析原因并给出修复方案。直接输出修复后的代码。
+    output:
+      save_to: "{{ config.work_dir }}/specs/fix_plan.md"
+    timeout: 300
+
+  # 分析完成后，runner 会找到 compile_check 重新执行
+  # 因为 compile_check 依赖 code_development（已完成），
+  # 但 compile_check 本身已被标记失败并清除，runner 会重新执行它
+
+  - id: compile_check_retry
+    type: script
+    description: "重新编译"
+    depends_on: [compile_failure_analysis]
+    command: "cd {{ config.work_dir }} && npm run build 2>&1"
+    on_failure:
+      action: goto
+      target: compile_failure_analysis   # 仍然失败就继续循环
+
+  # ── 冒烟测试 ──
+  - id: smoke_test
+    type: script
+    description: "冒烟测试"
+    depends_on: [compile_check_retry]
+    command: "./examples/scripts/smoke_test.sh {{ config.work_dir }}"
+    timeout: 120
+
+  # ── 上线部署 ──
+  - id: deploy
+    type: script
+    description: "上线部署"
+    depends_on: [smoke_test]
+    command: "./examples/scripts/deploy.sh {{ config.work_dir }}"
+    timeout: 300
+
+  # ── 代码审查 ──
+  - id: code_review
+    type: llm
+    description: "AI 代码审查"
+    depends_on: [deploy]
+    skill_dir: "./examples/skills/code_review"
+    user_prompt: |
+      审查以下改动。需求规格：
+
+      {{ steps.requirement_analysis.output }}
+
+      请产出 CR 报告，列出问题和建议。
+    output:
+      save_to: "{{ config.work_dir }}/specs/cr_report.md"
+    timeout: 300
+
+  # ── CR 确认 ──
+  - id: cr_approval
+    type: approval
+    description: "确认 CR 结果"
+    depends_on: [code_review]
+    message: |
+      CR 完成。报告: {{ config.work_dir }}/specs/cr_report.md
+    show_file: "{{ config.work_dir }}/specs/cr_report.md"
+    choices:
+      - label: "通过，归档"
+      - label: "驳回，重新开发"
+        next: code_development   # Python-level loop back

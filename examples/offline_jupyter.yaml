@@ -1,0 +1,32 @@
+name: "离线 Jupyter 数据分析"
+version: "1.0"
+
+context:
+  work_dir: "./notebooks"
+  model: "claude-sonnet-4-6"
+
+steps:
+
+  - id: setup_env
+    type: script
+    description: "检查环境"
+    command: "which jupyter && python3 -c 'import pandas, numpy, matplotlib' 2>&1"
+
+  - id: data_analysis
+    type: llm
+    description: "数据分析"
+    depends_on: [setup_env]
+    skill_dir: "./examples/skills/jupyter_analyst"
+    user_prompt: |
+      请在 Jupyter 中分析以下数据任务：
+
+      {{ input.task }}
+    output:
+      save_to: "{{ config.work_dir }}/analysis_result.md"
+    timeout: 600
+
+  - id: export_results
+    type: script
+    description: "导出结果"
+    depends_on: [data_analysis]
+    command: "python3 -c 'print(\"Results exported.\")'"
