@@ -38,6 +38,9 @@ steps:
     type: llm
     description: "按规格实现代码"
     depends_on: [human_review]
+    agent:
+      permission_mode: "acceptEdits"      # 允许直接写文件
+      allowed_tools: [Read, Write, Edit, Bash, Glob, Grep]
     skill_dir: "./examples/skills/code_development"
     user_prompt: |
       根据以下规格实现代码：
@@ -90,11 +93,16 @@ steps:
     depends_on: [smoke_test]
     command: "./examples/scripts/deploy.sh {{ config.work_dir }}"
 
-  # ── 代码审查 ──
+  # ── 代码审查 (独立 agent，只读) ──
   - id: code_review
     type: llm
-    description: "AI 代码审查"
+    description: "AI 代码审查 — 独立 agent session，只读权限"
     depends_on: [deploy]
+    agent:
+      model: "claude-sonnet-4-6"         # 可以用和开发不同的模型
+      permission_mode: "plan"             # 只读模式，不允许修改代码
+      allowed_tools: [Read, Grep, Glob]   # 只能读，不能写/执行
+      max_turns: 15
     skill_dir: "./examples/skills/code_review"
     user_prompt: |
       审查以下改动。需求规格：

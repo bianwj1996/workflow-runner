@@ -91,17 +91,17 @@ async def run_llm(step: dict, ctx: dict) -> dict:
     else:
         raise ValueError("LLM step requires 'skill_dir', 'system_prompt_file', or 'system_prompt'")
 
+    # Merge agent block — per-step agent config with fallback to workflow defaults
+    agent = {**step.get("agent", {})}
     user_prompt = render(step["user_prompt"], ctx)
-    cwd = step.get("cwd") or ctx.get("config", {}).get("work_dir") or os.getcwd()
+    cwd = agent.get("cwd") or step.get("cwd") or ctx.get("config", {}).get("work_dir") or os.getcwd()
     cwd = render(cwd, ctx) if cwd else cwd
-    model = step.get("model") or ctx.get("config", {}).get("model")
-    permission_mode = step.get("permission_mode", "default")
-
-    # Build option overrides from step config
-    max_turns = step.get("max_turns")
-    allowed_tools = step.get("allowed_tools", ["Read", "Write", "Edit", "Bash", "Glob", "Grep"])
-    disallowed_tools = step.get("disallowed_tools", [])
-    thinking = step.get("thinking")
+    model = agent.get("model") or step.get("model") or ctx.get("config", {}).get("model")
+    permission_mode = agent.get("permission_mode", step.get("permission_mode", "default"))
+    max_turns = agent.get("max_turns") or step.get("max_turns")
+    allowed_tools = agent.get("allowed_tools") or step.get("allowed_tools") or ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
+    disallowed_tools = agent.get("disallowed_tools") or step.get("disallowed_tools") or []
+    thinking = agent.get("thinking") or step.get("thinking")
 
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,

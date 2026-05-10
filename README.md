@@ -43,7 +43,7 @@ workflow.yaml          skill/SKILL.md        scripts/*.sh
 
 | type | description | key fields |
 |------|-------------|------------|
-| `llm` | Claude agent session | `skill_dir`, `user_prompt`, `output.save_to` |
+| `llm` | Fresh Claude agent session | `skill_dir`, `user_prompt`, `agent`, `output.save_to` |
 | `script` | Shell command | `command`, `on_failure` |
 | `approval` | Human confirmation | `message`, `show_file`, `choices` |
 
@@ -95,6 +95,36 @@ skill_dir: "./skills/requirement_analysis"
 ```
 
 To use a skill from anywhere, just copy the directory — no code changes needed.
+
+## Agent Isolation
+
+Each `llm` step spawns a **brand new Claude agent session** — no context leaks between steps. The `agent` block makes this explicit and lets you configure different models or permissions per step:
+
+```yaml
+# 代码开发 agent — 需要写权限
+- id: code_development
+  type: llm
+  agent:
+    permission_mode: "acceptEdits"
+    allowed_tools: [Read, Write, Edit, Bash, Glob, Grep]
+
+# CR agent — 只读，不同模型，防止"自己审自己"
+- id: code_review
+  type: llm
+  agent:
+    model: "claude-opus-4-7"
+    permission_mode: "plan"
+    allowed_tools: [Read, Grep, Glob]    # 只能读
+    max_turns: 15
+```
+
+| agent field | default | description |
+|-------------|---------|-------------|
+| `model` | workflow default | Claude model for this step |
+| `permission_mode` | `"default"` | `default` / `acceptEdits` / `plan` / `bypassPermissions` |
+| `allowed_tools` | all | Tools this agent can use |
+| `max_turns` | unlimited | Max tool-calling round-trips |
+| `cwd` | workflow `work_dir` | Working directory |
 
 ## CLI
 
