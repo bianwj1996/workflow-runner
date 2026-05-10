@@ -99,9 +99,10 @@ steps:
     description: "AI 代码审查 — 独立 agent session，只读权限"
     depends_on: [deploy]
     agent:
-      model: "claude-sonnet-4-6"         # 可以用和开发不同的模型
-      permission_mode: "plan"             # 只读模式，不允许修改代码
-      allowed_tools: [Read, Grep, Glob]   # 只能读，不能写/执行
+      session: new                        # 独立 session，看不到开发历史
+      model: "claude-sonnet-4-6"
+      permission_mode: "plan"             # 只读模式
+      allowed_tools: [Read, Grep, Glob]   # 只能读
       max_turns: 15
     skill_dir: "./examples/skills/code_review"
     user_prompt: |

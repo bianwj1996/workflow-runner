@@ -96,30 +96,42 @@ skill_dir: "./skills/requirement_analysis"
 
 To use a skill from anywhere, just copy the directory — no code changes needed.
 
-## Agent Isolation
+## Session Model
 
-Each `llm` step spawns a **brand new Claude agent session** — no context leaks between steps. The `agent` block makes this explicit and lets you configure different models or permissions per step:
+**Default: shared.** All LLM steps run in the same Claude agent session.
+Requirement analysis context (clarifications, decisions, trade-offs) is preserved
+and available to code development. Each step's skill is injected as part of the
+user message so the agent always knows what to do.
+
+**Opt-in: isolated.** Add `agent.session: new` to spawn a fresh session for a
+specific step. The step's skill becomes the system_prompt, and no prior
+conversation history leaks in.
 
 ```yaml
-# 代码开发 agent — 需要写权限
+# 共享 session — 需求分析的历史自动传给代码开发
+- id: requirement_analysis
+  type: llm
+  skill_dir: "./skills/requirement_analysis"
+  # agent.session 默认 "shared"
+
 - id: code_development
   type: llm
   agent:
     permission_mode: "acceptEdits"
-    allowed_tools: [Read, Write, Edit, Bash, Glob, Grep]
 
-# CR agent — 只读，不同模型，防止"自己审自己"
+# 独立 session — CR 看不到开发历史，防止"自己审自己"
 - id: code_review
   type: llm
   agent:
-    model: "claude-opus-4-7"
+    session: new                       # ← 显式隔离
+    model: "claude-sonnet-4-6"
     permission_mode: "plan"
-    allowed_tools: [Read, Grep, Glob]    # 只能读
-    max_turns: 15
+    allowed_tools: [Read, Grep, Glob]
 ```
 
 | agent field | default | description |
 |-------------|---------|-------------|
+| `session` | `"shared"` | `shared` (preserve history) or `new` (fresh session) |
 | `model` | workflow default | Claude model for this step |
 | `permission_mode` | `"default"` | `default` / `acceptEdits` / `plan` / `bypassPermissions` |
 | `allowed_tools` | all | Tools this agent can use |

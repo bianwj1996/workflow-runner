@@ -2,7 +2,10 @@
 """
 Workflow Runner — YAML-configurable LLM+script pipeline with hard constraints.
 
-Uses claude-agent-sdk to run Claude Code agent sessions for each LLM step.
+Default: all LLM steps share ONE Claude agent session, preserving conversation
+context (decisions, clarifications) across steps like requirement_analysis → code_development.
+
+Opt-in isolation: agent.session: "new" gives a step its own fresh session (e.g. CR).
 
 Usage:
     python3 runner.py --workflow online_dev.yaml --task "开发用户登录功能"
@@ -16,7 +19,6 @@ import json
 import os
 import subprocess
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -28,12 +30,11 @@ try:
     from claude_agent_sdk import (
         AssistantMessage,
         ClaudeAgentOptions,
+        ClaudeSDKClient,
         ResultMessage,
         TextBlock,
         ThinkingBlock,
         ToolUseBlock,
-        ToolResultBlock,
-        query,
     )
 except ImportError:
     print("claude-agent-sdk not installed. Run: pip install claude-agent-sdk")
@@ -73,27 +74,21 @@ def resolve_skill_dir(skill_dir: str) -> str:
     return str(skill_md)
 
 
-# ── LLM step executor (claude-agent-sdk) ───────────────────────
-async def run_llm(step: dict, ctx: dict) -> dict:
-    """Execute an LLM step using Claude Agent SDK.
-
-    Each step gets a fresh agent session — clean context, no carry-over.
-    The skill's SKILL.md becomes the system_prompt.
-    """
-    # Resolve system prompt
+def read_skill(step: dict, ctx: dict) -> str:
+    """Resolve and read the skill content for a step."""
     if "skill_dir" in step:
         skill_dir = render(step["skill_dir"], ctx)
-        system_prompt = Path(resolve_skill_dir(skill_dir)).read_text(encoding="utf-8")
+        return Path(resolve_skill_dir(skill_dir)).read_text(encoding="utf-8")
     elif "system_prompt_file" in step:
-        system_prompt = render_file(step["system_prompt_file"], ctx)
+        return render_file(step["system_prompt_file"], ctx)
     elif "system_prompt" in step:
-        system_prompt = render(step["system_prompt"], ctx)
-    else:
-        raise ValueError("LLM step requires 'skill_dir', 'system_prompt_file', or 'system_prompt'")
+        return render(step["system_prompt"], ctx)
+    raise ValueError("LLM step requires 'skill_dir', 'system_prompt_file', or 'system_prompt'")
 
-    # Merge agent block — per-step agent config with fallback to workflow defaults
+
+# ── Agent options builder ──────────────────────────────────────
+def build_agent_options(step: dict, ctx: dict, system_prompt: str) -> ClaudeAgentOptions:
     agent = {**step.get("agent", {})}
-    user_prompt = render(step["user_prompt"], ctx)
     cwd = agent.get("cwd") or step.get("cwd") or ctx.get("config", {}).get("work_dir") or os.getcwd()
     cwd = render(cwd, ctx) if cwd else cwd
     model = agent.get("model") or step.get("model") or ctx.get("config", {}).get("model")
@@ -103,7 +98,7 @@ async def run_llm(step: dict, ctx: dict) -> dict:
     disallowed_tools = agent.get("disallowed_tools") or step.get("disallowed_tools") or []
     thinking = agent.get("thinking") or step.get("thinking")
 
-    options = ClaudeAgentOptions(
+    opts = ClaudeAgentOptions(
         system_prompt=system_prompt,
         permission_mode=permission_mode,
         cwd=cwd,
@@ -111,81 +106,12 @@ async def run_llm(step: dict, ctx: dict) -> dict:
         disallowed_tools=disallowed_tools,
     )
     if model:
-        options.model = model
+        opts.model = model
     if max_turns is not None:
-        options.max_turns = max_turns
+        opts.max_turns = max_turns
     if thinking is not None:
-        options.thinking = thinking
-
-    retries = step.get("retry", 0) + 1
-    last_output = ""
-    all_text: list[str] = []
-    usage_info: dict[str, Any] = {}
-    cost = 0.0
-    duration_ms = 0
-    final_subtype = ""
-
-    for attempt in range(retries):
-        try:
-            all_text = []
-            async for message in query(prompt=user_prompt, options=options):
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            all_text.append(block.text)
-                        elif isinstance(block, ToolUseBlock):
-                            print(f"  🔧 {block.name}({json.dumps(block.input, ensure_ascii=False)[:120]})")
-                        elif isinstance(block, ThinkingBlock):
-                            print(f"  💭 {block.thinking[:200]}...")
-                        elif isinstance(block, ToolResultBlock):
-                            pass  # tool results are internal
-
-                elif isinstance(message, ResultMessage):
-                    cost = message.total_cost_usd or 0
-                    duration_ms = message.duration_ms or 0
-                    final_subtype = message.subtype or ""
-                    if message.usage:
-                        usage_info = message.usage
-                    if message.is_error:
-                        raise RuntimeError(
-                            f"Agent error: {message.errors}, subtype={message.subtype}"
-                        )
-
-            combined_text = "\n".join(all_text)
-            last_output = combined_text
-
-            # Save output if configured
-            save_path = step.get("output", {}).get("save_to")
-            if save_path:
-                dst = render(save_path, ctx | {"_last_output": combined_text})
-                Path(dst).parent.mkdir(parents=True, exist_ok=True)
-                Path(dst).write_text(combined_text, encoding="utf-8")
-
-            if final_subtype == "error_during_execution":
-                raise RuntimeError(f"Agent ended with error: {combined_text[-500:]}")
-
-            return {
-                "status": "ok",
-                "output": combined_text,
-                "model": model or "default",
-                "cost_usd": cost,
-                "duration_ms": duration_ms,
-                "usage": usage_info,
-                "subtype": final_subtype,
-            }
-
-        except Exception as e:
-            if attempt < retries - 1:
-                print(f"  ⚠ Attempt {attempt + 1} failed: {e}, retrying in {2 ** attempt}s...")
-                await asyncio.sleep(2 ** attempt)
-                continue
-            return {
-                "status": "failed",
-                "error": str(e),
-                "output": last_output,
-            }
-
-    return {"status": "failed", "error": "max retries exceeded"}
+        opts.thinking = thinking
+    return opts
 
 
 # ── Script step executor ───────────────────────────────────────
@@ -259,18 +185,158 @@ class WorkflowRunner:
         self.state: dict = {"steps": {}, "meta": {}}
         self.ctx: dict = {}
 
+        # Session management
+        self._client: ClaudeSDKClient | None = None
+        self._session_label: str = ""
+
     def run(self, inputs: dict, resume_from: str | None = None):
-        asyncio.run(self._run(inputs, resume_from))
+        try:
+            asyncio.run(self._run(inputs, resume_from))
+        finally:
+            if self._client:
+                try:
+                    asyncio.run(self._client.disconnect())
+                except Exception:
+                    pass
+
+    # ── Session management ──────────────────────────────────
+
+    async def _ensure_client(self, step: dict) -> ClaudeSDKClient:
+        """Get or create the ClaudeSDKClient for this step.
+
+        session: "shared" (default) — reuse existing client, preserve history
+        session: "new"            — disconnect old, create fresh isolated client
+        """
+        session_mode = step.get("agent", {}).get("session", "shared")
+        skill = read_skill(step, self.ctx)
+
+        if session_mode == "new":
+            # Tear down shared session if any
+            if self._client:
+                await self._client.disconnect()
+                self._client = None
+                self._session_label = ""
+
+            step_label = f"{step['id']} (isolated)"
+            print(f"  🆕 新 session: {step_label}")
+            options = build_agent_options(step, self.ctx, skill)
+            self._client = ClaudeSDKClient(options=options)
+            await self._client.connect()
+            self._session_label = step_label
+            return self._client
+
+        # session: shared — reuse or create shared session
+        if self._client is None:
+            print(f"  🔗 共享 session: {step['id']} (首个 LLM 步骤)")
+            options = build_agent_options(step, self.ctx, skill)
+            self._client = ClaudeSDKClient(options=options)
+            await self._client.connect()
+            self._session_label = "shared"
+        else:
+            print(f"  🔗 共享 session: {step['id']} (续接 {self._session_label})")
+
+        return self._client
+
+    # ── LLM step executor ────────────────────────────────────
+
+    async def _run_llm(self, step: dict) -> dict:
+        skill = read_skill(step, self.ctx)
+        client = await self._ensure_client(step)
+        session_mode = step.get("agent", {}).get("session", "shared")
+
+        if session_mode == "new":
+            # Isolated session: skill = system_prompt, user_prompt = task only
+            user_message = render(step["user_prompt"], self.ctx)
+        else:
+            # Shared session: skill goes into user message as step instructions
+            user_message = render(
+                "## 当前步骤说明\n\n"
+                f"{skill}\n\n"
+                "## 任务\n\n"
+                f"{render(step['user_prompt'], self.ctx)}",
+                self.ctx,
+            )
+
+        agent_cfg = step.get("agent", {})
+        model = agent_cfg.get("model") or step.get("model") or self.config.get("context", {}).get("model")
+        retries = step.get("retry", 0) + 1
+        all_text: list[str] = []
+        usage_info: dict[str, Any] = {}
+        cost = 0.0
+        duration_ms = 0
+        final_subtype = ""
+        last_output = ""
+
+        for attempt in range(retries):
+            try:
+                all_text = []
+                await client.query(user_message)
+
+                async for message in client.receive_response():
+                    if isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                all_text.append(block.text)
+                            elif isinstance(block, ToolUseBlock):
+                                print(f"  🔧 {block.name}({json.dumps(block.input, ensure_ascii=False)[:120]})")
+                            elif isinstance(block, ThinkingBlock):
+                                print(f"  💭 {block.thinking[:200]}...")
+
+                    elif isinstance(message, ResultMessage):
+                        cost = message.total_cost_usd or 0
+                        duration_ms = message.duration_ms or 0
+                        final_subtype = message.subtype or ""
+                        if message.usage:
+                            usage_info = message.usage
+                        if message.is_error:
+                            raise RuntimeError(
+                                f"Agent error: {message.errors}, subtype={message.subtype}"
+                            )
+
+                combined_text = "\n".join(all_text)
+                last_output = combined_text
+
+                save_path = step.get("output", {}).get("save_to")
+                if save_path:
+                    dst = render(save_path, self.ctx | {"_last_output": combined_text})
+                    Path(dst).parent.mkdir(parents=True, exist_ok=True)
+                    Path(dst).write_text(combined_text, encoding="utf-8")
+
+                if final_subtype == "error_during_execution":
+                    raise RuntimeError(f"Agent ended with error: {combined_text[-500:]}")
+
+                return {
+                    "status": "ok",
+                    "output": combined_text,
+                    "model": model or "default",
+                    "cost_usd": cost,
+                    "duration_ms": duration_ms,
+                    "usage": usage_info,
+                    "subtype": final_subtype,
+                }
+
+            except Exception as e:
+                if attempt < retries - 1:
+                    print(f"  ⚠ Attempt {attempt + 1} failed: {e}, retrying...")
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                return {"status": "failed", "error": str(e), "output": last_output}
+
+        return {"status": "failed", "error": "max retries exceeded"}
+
+    # ── Step dispatch ────────────────────────────────────────
 
     async def _execute_step(self, step: dict) -> dict:
         if step["type"] == "llm":
-            return await run_llm(step, self.ctx)
+            return await self._run_llm(step)
         elif step["type"] == "script":
             return run_script(step, self.ctx)
         elif step["type"] == "approval":
             return run_approval(step, self.ctx, self.auto_yes)
         else:
             return {"status": "failed", "error": f"Unknown step type: {step['type']}"}
+
+    # ── Main loop ────────────────────────────────────────────
 
     async def _run(self, inputs: dict, resume_from: str | None = None):
         self.ctx = build_context(self.config, inputs, self.state)
@@ -311,7 +377,8 @@ class WorkflowRunner:
                 break
 
             print(f"\n{'─'*60}\n▶ [{step['id']}] {step.get('description', '')}")
-            print(f"  type: {step['type']}")
+            session = step.get("agent", {}).get("session", "shared") if step["type"] == "llm" else "-"
+            print(f"  type: {step['type']}  session: {session}")
 
             if self.dry_run:
                 print(f"  [dry-run] Would execute, skipping.")
@@ -356,6 +423,8 @@ class WorkflowRunner:
         if iteration >= max_iterations:
             print("✗ 达到最大迭代次数，可能存在死循环。")
             sys.exit(1)
+
+    # ── DAG helpers ──────────────────────────────────────────
 
     def _next_ready_step(self, executed: set[str]) -> dict | None:
         for step in self.config["steps"]:
