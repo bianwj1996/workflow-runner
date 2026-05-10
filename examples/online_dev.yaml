@@ -17,8 +17,6 @@ steps:
       {{ input.task }}
     output:
       save_to: "{{ config.work_dir }}/specs/analysis.md"
-    timeout: 300
-    retry: 2
 
   # ── 人机确认 ──
   - id: human_review
@@ -47,10 +45,13 @@ steps:
       {{ steps.requirement_analysis.output }}
     output:
       save_to: "{{ config.work_dir }}/src/"
-    timeout: 600
-    retry: 1
 
-  # ── 编译检查 ──
+  # ════════════════════════════════════════════════════════════
+  #  编译─修复 循环 (Python-level loop)
+  #  compile → 失败 → analyze → compile → 失败 → analyze → ...
+  #  直到编译通过，才进入冒烟测试
+  # ════════════════════════════════════════════════════════════
+
   - id: compile_check
     type: script
     description: "编译验证"
@@ -58,43 +59,29 @@ steps:
     command: "cd {{ config.work_dir }} && npm run build 2>&1"
     on_failure:
       action: goto
-      target: compile_failure_analysis
+      target: compile_failure_analysis    # ← 回退到分析节点
 
-  # ── 编译失败分析 ──
   - id: compile_failure_analysis
     type: llm
-    description: "分析编译失败原因"
+    description: "分析编译失败原因并修复代码"
     skill_dir: "./examples/skills/failure_analysis"
     user_prompt: |
       编译失败，错误信息：
 
       {{ steps.compile_check.stderr }}
 
-      请分析原因并给出修复方案。直接输出修复后的代码。
+      请分析原因并给出修复后的代码。
     output:
       save_to: "{{ config.work_dir }}/specs/fix_plan.md"
-    timeout: 300
-
-  # 分析完成后，runner 会找到 compile_check 重新执行
-  # 因为 compile_check 依赖 code_development（已完成），
-  # 但 compile_check 本身已被标记失败并清除，runner 会重新执行它
-
-  - id: compile_check_retry
-    type: script
-    description: "重新编译"
-    depends_on: [compile_failure_analysis]
-    command: "cd {{ config.work_dir }} && npm run build 2>&1"
-    on_failure:
-      action: goto
-      target: compile_failure_analysis   # 仍然失败就继续循环
+    # 没有 depends_on —— 只通过 on_failure: goto 到达
+    # 执行完毕后 compile_check 自动变为 ready（依赖的 code_development 已满足）
 
   # ── 冒烟测试 ──
   - id: smoke_test
     type: script
     description: "冒烟测试"
-    depends_on: [compile_check_retry]
+    depends_on: [compile_check]            # ← 编译通过后才执行
     command: "./examples/scripts/smoke_test.sh {{ config.work_dir }}"
-    timeout: 120
 
   # ── 上线部署 ──
   - id: deploy
@@ -102,7 +89,6 @@ steps:
     description: "上线部署"
     depends_on: [smoke_test]
     command: "./examples/scripts/deploy.sh {{ config.work_dir }}"
-    timeout: 300
 
   # ── 代码审查 ──
   - id: code_review
@@ -118,9 +104,12 @@ steps:
       请产出 CR 报告，列出问题和建议。
     output:
       save_to: "{{ config.work_dir }}/specs/cr_report.md"
-    timeout: 300
 
-  # ── CR 确认 ──
+  # ════════════════════════════════════════════════════════════
+  #  CR 驳回 → 重新开发 循环 (Python-level loop)
+  #  CR 不通过 → 回到代码开发 → 编译 → 冒烟 → 部署 → 再 CR
+  # ════════════════════════════════════════════════════════════
+
   - id: cr_approval
     type: approval
     description: "确认 CR 结果"
@@ -131,4 +120,4 @@ steps:
     choices:
       - label: "通过，归档"
       - label: "驳回，重新开发"
-        next: code_development   # Python-level loop back
+        next: code_development               # ← 回退到开发节点，触发完整重跑
