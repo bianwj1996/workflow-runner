@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: workflow-runner
+Version: 1.0.0
+Summary: YAML-configurable LLM workflow runner with hard constraints
+Requires-Python: >=3.10
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: jinja2>=3.0
+Requires-Dist: claude-agent-sdk>=0.1.0

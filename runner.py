@@ -41,6 +41,15 @@ except ImportError:
     sys.exit(1)
 
 
+# ── Path resolution ───────────────────────────────────────────
+def resolve_path(path: str, base_dir: Path) -> str:
+    """Resolve a path: absolute paths stay, relative paths resolve against base_dir."""
+    p = Path(path)
+    if p.is_absolute():
+        return str(p)
+    return str((base_dir / p).resolve())
+
+
 # ── Template rendering ─────────────────────────────────────────
 def render(template: str, ctx: dict) -> str:
     return Template(template).render(**ctx)
@@ -51,12 +60,13 @@ def render_file(path: str, ctx: dict) -> str:
 
 
 # ── Context helpers ────────────────────────────────────────────
-def build_context(config: dict, inputs: dict, state: dict) -> dict:
+def build_context(config: dict, inputs: dict, state: dict, base_dir: Path) -> dict:
     ctx: dict[str, Any] = {
         "input": inputs,
         "env": os.environ.copy(),
         "config": config.get("context", {}),
         "steps": {},
+        "workflow_dir": str(base_dir),
     }
     for step_id, result in state.get("steps", {}).items():
         ctx["steps"][step_id] = result
@@ -64,8 +74,8 @@ def build_context(config: dict, inputs: dict, state: dict) -> dict:
 
 
 # ── Skill resolution ───────────────────────────────────────────
-def resolve_skill_dir(skill_dir: str) -> str:
-    skill_path = Path(skill_dir)
+def resolve_skill_dir(skill_dir: str, base_dir: Path) -> str:
+    skill_path = Path(resolve_path(skill_dir, base_dir))
     if not skill_path.is_dir():
         raise FileNotFoundError(f"Skill directory not found: {skill_dir}")
     skill_md = skill_path / "SKILL.md"
@@ -74,23 +84,24 @@ def resolve_skill_dir(skill_dir: str) -> str:
     return str(skill_md)
 
 
-def read_skill(step: dict, ctx: dict) -> str:
+def read_skill(step: dict, ctx: dict, base_dir: Path) -> str:
     """Resolve and read the skill content for a step."""
     if "skill_dir" in step:
         skill_dir = render(step["skill_dir"], ctx)
-        return Path(resolve_skill_dir(skill_dir)).read_text(encoding="utf-8")
+        return Path(resolve_skill_dir(skill_dir, base_dir)).read_text(encoding="utf-8")
     elif "system_prompt_file" in step:
-        return render_file(step["system_prompt_file"], ctx)
+        return render_file(resolve_path(render(step["system_prompt_file"], ctx), base_dir), ctx)
     elif "system_prompt" in step:
         return render(step["system_prompt"], ctx)
     raise ValueError("LLM step requires 'skill_dir', 'system_prompt_file', or 'system_prompt'")
 
 
 # ── Agent options builder ──────────────────────────────────────
-def build_agent_options(step: dict, ctx: dict, system_prompt: str) -> ClaudeAgentOptions:
+def build_agent_options(step: dict, ctx: dict, system_prompt: str, base_dir: Path) -> ClaudeAgentOptions:
     agent = {**step.get("agent", {})}
     cwd = agent.get("cwd") or step.get("cwd") or ctx.get("config", {}).get("work_dir") or os.getcwd()
     cwd = render(cwd, ctx) if cwd else cwd
+    cwd = resolve_path(cwd, base_dir) if cwd else cwd
     model = agent.get("model") or step.get("model") or ctx.get("config", {}).get("model")
     permission_mode = agent.get("permission_mode", step.get("permission_mode", "default"))
     max_turns = agent.get("max_turns") or step.get("max_turns")
@@ -115,11 +126,13 @@ def build_agent_options(step: dict, ctx: dict, system_prompt: str) -> ClaudeAgen
 
 
 # ── Script step executor ───────────────────────────────────────
-def run_script(step: dict, ctx: dict) -> dict:
+def run_script(step: dict, ctx: dict, base_dir: Path) -> dict:
     cmd = render(step["command"], ctx)
     cwd = step.get("cwd")
     if cwd:
-        cwd = render(cwd, ctx)
+        cwd = resolve_path(render(cwd, ctx), base_dir)
+    else:
+        cwd = str(base_dir)
     timeout = step.get("timeout", 300)
 
     try:
@@ -140,7 +153,7 @@ def run_script(step: dict, ctx: dict) -> dict:
 
 
 # ── Approval step executor ─────────────────────────────────────
-def run_approval(step: dict, ctx: dict, auto_yes: bool) -> dict:
+def run_approval(step: dict, ctx: dict, auto_yes: bool, base_dir: Path) -> dict:
     if auto_yes:
         print(f"  [auto-yes] Skipping approval: {step.get('description', step['id'])}")
         return {"status": "ok", "approved": True, "auto": True}
@@ -148,9 +161,9 @@ def run_approval(step: dict, ctx: dict, auto_yes: bool) -> dict:
     msg = render(step.get("message", "Proceed?"), ctx)
     show = step.get("show_file")
     if show:
-        fp = render(show, ctx)
+        fp = resolve_path(render(show, ctx), base_dir)
         if Path(fp).exists():
-            print(f"\n{'─'*40}\n{Path(fp).read_text(encoding='utf-8')}\n{'─'*40}\n")
+            print(f"\n{'-'*40}\n{Path(fp).read_text(encoding='utf-8')}\n{'-'*40}\n")
 
     print(f"\n{'='*50}\n{msg}\n{'='*50}")
 
@@ -177,8 +190,9 @@ def run_approval(step: dict, ctx: dict, auto_yes: bool) -> dict:
 # ── Main runner ────────────────────────────────────────────────
 class WorkflowRunner:
     def __init__(self, config_path: str, auto_yes: bool = False, dry_run: bool = False):
-        self.config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
         self.config_path = Path(config_path).resolve()
+        self.base_dir = self.config_path.parent  # all relative paths resolve from YAML's directory
+        self.config = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
         self.auto_yes = auto_yes
         self.dry_run = dry_run
         self.state_path = Path(config_path).with_suffix(".state.json")
@@ -208,7 +222,7 @@ class WorkflowRunner:
         session: "new"            — disconnect old, create fresh isolated client
         """
         session_mode = step.get("agent", {}).get("session", "shared")
-        skill = read_skill(step, self.ctx)
+        skill = read_skill(step, self.ctx, self.base_dir)
 
         if session_mode == "new":
             # Tear down shared session if any
@@ -218,8 +232,8 @@ class WorkflowRunner:
                 self._session_label = ""
 
             step_label = f"{step['id']} (isolated)"
-            print(f"  🆕 新 session: {step_label}")
-            options = build_agent_options(step, self.ctx, skill)
+            print(f"  [NEW] isolated session: {step_label}")
+            options = build_agent_options(step, self.ctx, skill, self.base_dir)
             self._client = ClaudeSDKClient(options=options)
             await self._client.connect()
             self._session_label = step_label
@@ -227,20 +241,20 @@ class WorkflowRunner:
 
         # session: shared — reuse or create shared session
         if self._client is None:
-            print(f"  🔗 共享 session: {step['id']} (首个 LLM 步骤)")
-            options = build_agent_options(step, self.ctx, skill)
+            print(f"  [SHARED] session: {step['id']} (first LLM step)")
+            options = build_agent_options(step, self.ctx, skill, self.base_dir)
             self._client = ClaudeSDKClient(options=options)
             await self._client.connect()
             self._session_label = "shared"
         else:
-            print(f"  🔗 共享 session: {step['id']} (续接 {self._session_label})")
+            print(f"  [SHARED] session: {step['id']} (cont from {self._session_label})")
 
         return self._client
 
     # ── LLM step executor ────────────────────────────────────
 
     async def _run_llm(self, step: dict) -> dict:
-        skill = read_skill(step, self.ctx)
+        skill = read_skill(step, self.ctx, self.base_dir)
         client = await self._ensure_client(step)
         session_mode = step.get("agent", {}).get("session", "shared")
 
@@ -250,9 +264,9 @@ class WorkflowRunner:
         else:
             # Shared session: skill goes into user message as step instructions
             user_message = render(
-                "## 当前步骤说明\n\n"
+                "## Step Instructions\n\n"
                 f"{skill}\n\n"
-                "## 任务\n\n"
+                "## Task\n\n"
                 f"{render(step['user_prompt'], self.ctx)}",
                 self.ctx,
             )
@@ -278,9 +292,9 @@ class WorkflowRunner:
                             if isinstance(block, TextBlock):
                                 all_text.append(block.text)
                             elif isinstance(block, ToolUseBlock):
-                                print(f"  🔧 {block.name}({json.dumps(block.input, ensure_ascii=False)[:120]})")
+                                print(f"  [TOOL] {block.name}({json.dumps(block.input, ensure_ascii=False)[:120]})")
                             elif isinstance(block, ThinkingBlock):
-                                print(f"  💭 {block.thinking[:200]}...")
+                                print(f"  [THINK] {block.thinking[:200]}...")
 
                     elif isinstance(message, ResultMessage):
                         cost = message.total_cost_usd or 0
@@ -298,7 +312,7 @@ class WorkflowRunner:
 
                 save_path = step.get("output", {}).get("save_to")
                 if save_path:
-                    dst = render(save_path, self.ctx | {"_last_output": combined_text})
+                    dst = resolve_path(render(save_path, self.ctx | {"_last_output": combined_text}), self.base_dir)
                     Path(dst).parent.mkdir(parents=True, exist_ok=True)
                     Path(dst).write_text(combined_text, encoding="utf-8")
 
@@ -317,7 +331,7 @@ class WorkflowRunner:
 
             except Exception as e:
                 if attempt < retries - 1:
-                    print(f"  ⚠ Attempt {attempt + 1} failed: {e}, retrying...")
+                    print(f"  [RETRY] Attempt {attempt + 1} failed: {e}, retrying...")
                     await asyncio.sleep(2 ** attempt)
                     continue
                 return {"status": "failed", "error": str(e), "output": last_output}
@@ -330,20 +344,20 @@ class WorkflowRunner:
         if step["type"] == "llm":
             return await self._run_llm(step)
         elif step["type"] == "script":
-            return run_script(step, self.ctx)
+            return run_script(step, self.ctx, self.base_dir)
         elif step["type"] == "approval":
-            return run_approval(step, self.ctx, self.auto_yes)
+            return run_approval(step, self.ctx, self.auto_yes, self.base_dir)
         else:
             return {"status": "failed", "error": f"Unknown step type: {step['type']}"}
 
     # ── Main loop ────────────────────────────────────────────
 
     async def _run(self, inputs: dict, resume_from: str | None = None):
-        self.ctx = build_context(self.config, inputs, self.state)
+        self.ctx = build_context(self.config, inputs, self.state, self.base_dir)
 
         if self.state_path.exists():
             self.state = json.loads(self.state_path.read_text(encoding="utf-8"))
-            self.ctx = build_context(self.config, inputs, self.state)
+            self.ctx = build_context(self.config, inputs, self.state, self.base_dir)
 
         self.state["meta"]["config"] = str(self.config_path)
         self.state["meta"]["started"] = datetime.now().isoformat()
@@ -373,10 +387,11 @@ class WorkflowRunner:
             iteration += 1
             step = self._next_ready_step(executed)
             if step is None:
-                print("\n✓ 所有步骤已完成。")
+                print("\n[OK] All steps completed.")
                 break
 
-            print(f"\n{'─'*60}\n▶ [{step['id']}] {step.get('description', '')}")
+            print(f"\n{'='*60}")
+            print(f">> [{step['id']}] {step.get('description', '')}")
             session = step.get("agent", {}).get("session", "shared") if step["type"] == "llm" else "-"
             print(f"  type: {step['type']}  session: {session}")
 
@@ -390,38 +405,38 @@ class WorkflowRunner:
                 **result, "executed_at": datetime.now().isoformat()
             }
             self._save_state()
-            self.ctx = build_context(self.config, inputs, self.state)
+            self.ctx = build_context(self.config, inputs, self.state, self.base_dir)
 
             if result["status"] == "failed":
-                print(f"✗ [{step['id']}] FAILED: {result.get('error') or result.get('stderr', '')}")
+                print(f"[FAIL] [{step['id']}] FAILED: {result.get('error') or result.get('stderr', '')}")
                 target = self._handle_failure(step)
                 if target:
-                    print(f"↩ 回退到: {target}")
+                    print(f"<- jump to: {target}")
                     executed.discard(target)
                     executed = self._clear_downstream(step["id"], executed)
                     continue
                 else:
-                    print("✗ 无可回退目标，流程中止。")
+                    print("[FAIL] No fallback target, aborting.")
                     self._save_state()
                     sys.exit(1)
 
             if result["status"] == "rejected":
-                print(f"✗ [{step['id']}] 被拒绝，流程中止。")
+                print(f"[FAIL] [{step['id']}] Rejected, aborting.")
                 self._save_state()
                 sys.exit(1)
 
-            print(f"✓ [{step['id']}] OK")
+            print(f"[OK] [{step['id']}] OK")
             executed.add(step["id"])
 
             if step["type"] == "approval" and result.get("next"):
                 next_step = result["next"]
                 if next_step != "archive":
-                    print(f"→ 路由到: {next_step}")
+                    print(f"-> route to: {next_step}")
                     executed.discard(next_step)
                     executed = self._clear_downstream(next_step, executed)
 
         if iteration >= max_iterations:
-            print("✗ 达到最大迭代次数，可能存在死循环。")
+            print("[FAIL] Max iterations reached, possible infinite loop.")
             sys.exit(1)
 
     # ── DAG helpers ──────────────────────────────────────────
@@ -493,7 +508,7 @@ def main():
     runner.run(inputs, resume_from=args.resume)
 
     if not args.dry_run and not args.no_state:
-        print(f"\n状态文件: {runner.state_path}")
+        print(f"\nState file: {runner.state_path}")
     elif args.no_state and runner.state_path.exists():
         runner.state_path.unlink()
 
