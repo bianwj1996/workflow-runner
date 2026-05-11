@@ -11,7 +11,7 @@ steps:
   - id: requirement_analysis
     type: llm
     description: "需求分析，产出规格文档"
-    skill_dir: "./examples/skills/requirement_analysis"
+    skill_dir: "requirement_analysis"
     user_prompt: |
       请分析以下需求，产出规格文档：
       {{ input.task }}
@@ -41,7 +41,7 @@ steps:
     agent:
       permission_mode: "acceptEdits"      # 允许直接写文件
       allowed_tools: [Read, Write, Edit, Bash, Glob, Grep]
-    skill_dir: "./examples/skills/code_development"
+    skill_dir: "code_development"
     user_prompt: |
       根据以下规格实现代码：
 
@@ -67,7 +67,7 @@ steps:
   - id: compile_failure_analysis
     type: llm
     description: "分析编译失败原因并修复代码"
-    skill_dir: "./examples/skills/failure_analysis"
+    skill_dir: "failure_analysis"
     user_prompt: |
       编译失败，错误信息：
 
@@ -104,7 +104,7 @@ steps:
       permission_mode: "plan"             # 只读模式
       allowed_tools: [Read, Grep, Glob]   # 只能读
       max_turns: 15
-    skill_dir: "./examples/skills/code_review"
+    skill_dir: "code_review"
     user_prompt: |
       审查以下改动。需求规格：
 

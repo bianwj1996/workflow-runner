@@ -74,21 +74,68 @@ def build_context(config: dict, inputs: dict, state: dict, base_dir: Path) -> di
 
 
 # ── Skill resolution ───────────────────────────────────────────
+def _is_skill_name(skill_dir: str) -> bool:
+    """Check if skill_dir is a bare name (no path separators or leading dots)."""
+    return "/" not in skill_dir and "\\" not in skill_dir and not skill_dir.startswith(".")
+
+
+def _check_skill_dir(path: Path) -> str | None:
+    """Return str(SKILL.md) if the directory contains it, else None."""
+    if path.is_dir() and (path / "SKILL.md").exists():
+        return str(path / "SKILL.md")
+    return None
+
+
 def resolve_skill_dir(skill_dir: str, base_dir: Path) -> str:
+    """Resolve skill_dir to a SKILL.md path.
+
+    If skill_dir is a bare name (e.g. "requirement_analysis"), search:
+      1. ~/.claude/skills/<name>/       (global user skills)
+      2. <base_dir>/.claude/skills/<name>/   (project Claude skills)
+      3. <base_dir>/skills/<name>/       (project skills)
+
+    If skill_dir is a path (e.g. "./my-skills/foo"), resolve relative to base_dir.
+    """
+    if _is_skill_name(skill_dir):
+        home = Path.home()
+
+        # 1. Global user skills
+        result = _check_skill_dir(home / ".claude" / "skills" / skill_dir)
+        if result:
+            return result
+
+        # 2. Project .claude/skills
+        result = _check_skill_dir(base_dir / ".claude" / "skills" / skill_dir)
+        if result:
+            return result
+
+        # 3. Project skills/
+        result = _check_skill_dir(base_dir / "skills" / skill_dir)
+        if result:
+            return result
+
+        searched = [
+            str(home / ".claude" / "skills" / skill_dir),
+            str(base_dir / ".claude" / "skills" / skill_dir),
+            str(base_dir / "skills" / skill_dir),
+        ]
+        raise FileNotFoundError(
+            f"Skill '{skill_dir}' not found. Searched:\n  " + "\n  ".join(searched)
+        )
+
+    # Path-based resolution (backwards compatibility)
     skill_path = Path(resolve_path(skill_dir, base_dir))
-    if not skill_path.is_dir():
-        raise FileNotFoundError(f"Skill directory not found: {skill_dir}")
-    skill_md = skill_path / "SKILL.md"
-    if not skill_md.exists():
-        raise FileNotFoundError(f"SKILL.md not found in skill directory: {skill_dir}")
-    return str(skill_md)
+    skill_md = _check_skill_dir(skill_path)
+    if skill_md:
+        return skill_md
+    raise FileNotFoundError(f"Skill directory not found: {skill_dir} ({skill_path})")
 
 
 def read_skill(step: dict, ctx: dict, base_dir: Path) -> str:
     """Resolve and read the skill content for a step."""
     if "skill_dir" in step:
-        skill_dir = render(step["skill_dir"], ctx)
-        return Path(resolve_skill_dir(skill_dir, base_dir)).read_text(encoding="utf-8")
+        skill_name = render(step["skill_dir"], ctx)
+        return Path(resolve_skill_dir(skill_name, base_dir)).read_text(encoding="utf-8")
     elif "system_prompt_file" in step:
         return render_file(resolve_path(render(step["system_prompt_file"], ctx), base_dir), ctx)
     elif "system_prompt" in step:

@@ -16,7 +16,7 @@ steps:
     type: llm
     description: "数据分析"
     depends_on: [setup_env]
-    skill_dir: "./examples/skills/jupyter_analyst"
+    skill_dir: "jupyter_analyst"
     user_prompt: |
       请在 Jupyter 中分析以下数据任务：
 

@@ -80,21 +80,28 @@ steps:
       target: failure_analysis      # ← hard-constraint jump
 ```
 
-## Skill Directory
+## Skill Resolution
 
-```
-skills/requirement_analysis/
-├── SKILL.md      # The system prompt injected into Claude
-└── README.md     # Description, inputs, outputs, dependencies
-```
-
-Reference in YAML:
+Each skill is a directory containing `SKILL.md` (the prompt) + `README.md` (docs).
+When you specify a **bare name** in the YAML:
 
 ```yaml
-skill_dir: "./skills/requirement_analysis"
+skill_dir: "requirement_analysis"   # no path separators = bare name
 ```
 
-To use a skill from anywhere, just copy the directory — no code changes needed.
+The runner searches three locations in order:
+
+| # | Location | Scope |
+|---|----------|-------|
+| 1 | `~/.claude/skills/<name>/` | Global — shared across all projects |
+| 2 | `<yaml_dir>/.claude/skills/<name>/` | Project — Claude Code convention |
+| 3 | `<yaml_dir>/skills/<name>/` | Project — flat skills directory |
+
+First match wins. If you use a **path** instead (contains `/`, `\`, or starts with `.`), it resolves directly relative to the YAML file:
+
+```yaml
+skill_dir: "./my-custom-skills/foo"   # path = direct resolution
+```
 
 ## Session Model
 
