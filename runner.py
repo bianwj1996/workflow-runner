@@ -491,6 +491,9 @@ class WorkflowRunner:
                     print(f"-> route to: {next_step}")
                     executed.discard(next_step)
                     executed = self._clear_downstream(next_step, executed)
+                    # Also clear the approval itself so it can re-run after the fix chain
+                    executed.discard(step["id"])
+                    executed = self._clear_downstream(step["id"], executed)
 
         if iteration >= max_iterations:
             print("[FAIL] Max iterations reached, possible infinite loop.")
