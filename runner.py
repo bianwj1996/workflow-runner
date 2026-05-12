@@ -155,6 +155,7 @@ def build_agent_options(step: dict, ctx: dict, system_prompt: str, base_dir: Pat
     allowed_tools = agent.get("allowed_tools") or step.get("allowed_tools") or ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
     disallowed_tools = agent.get("disallowed_tools") or step.get("disallowed_tools") or []
     thinking = agent.get("thinking") or step.get("thinking")
+    mcp_servers = agent.get("mcp_servers") or step.get("mcp_servers")
 
     opts = ClaudeAgentOptions(
         system_prompt=system_prompt,
@@ -169,6 +170,15 @@ def build_agent_options(step: dict, ctx: dict, system_prompt: str, base_dir: Pat
         opts.max_turns = max_turns
     if thinking is not None:
         opts.thinking = thinking
+    if mcp_servers:
+        # Render env values through Jinja2 so tokens/URLs can come from env vars
+        rendered_servers = {}
+        for name, cfg in mcp_servers.items():
+            rendered_cfg = dict(cfg)
+            if "env" in rendered_cfg:
+                rendered_cfg["env"] = {k: render(v, ctx) for k, v in rendered_cfg["env"].items()}
+            rendered_servers[name] = rendered_cfg
+        opts.mcp_servers = rendered_servers
     return opts
 
 

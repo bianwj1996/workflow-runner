@@ -7,23 +7,46 @@ context:
 
 steps:
 
-  - id: setup_env
+  - id: start_jupyter
     type: script
-    description: "检查环境"
-    command: "which jupyter && python3 -c 'import pandas, numpy, matplotlib' 2>&1"
+    description: "确认 Jupyter 可连接"
+    command: "curl -s http://localhost:8888/api/kernels | python3 -c 'import sys,json; print(len(json.load(sys.stdin)), \"kernel(s) running\")'"
 
   - id: data_analysis
     type: llm
-    description: "数据分析"
-    depends_on: [setup_env]
+    description: "通过 Jupyter MCP 分析数据"
+    depends_on: [start_jupyter]
+    agent:
+      session: shared
+      mcp_servers:
+        jupyter:
+          command: "uvx"
+          args: ["jupyter-mcp-server@latest"]
+          env:
+            JUPYTER_URL: "http://localhost:8888"
+            JUPYTER_TOKEN: "{{ env.JUPYTER_TOKEN }}"
+            ALLOW_IMG_OUTPUT: "true"
+      allowed_tools:
+        - Read
+        - Write
+        - Edit
+        - Bash
+        - Glob
+        - Grep
+        - mcp__jupyter__execute_code
+        - mcp__jupyter__execute_cell
+        - mcp__jupyter__read_cell
+        - mcp__jupyter__list_kernels
+        - mcp__jupyter__use_notebook
     skill_dir: "jupyter_analyst"
     user_prompt: |
-      请在 Jupyter 中分析以下数据任务：
+      使用 Jupyter 分析以下任务。用 execute_code 工具在 kernel 中运行代码。
 
       {{ input.task }}
+
+      完成分析后，产出报告。
     output:
       save_to: "{{ config.work_dir }}/analysis_result.md"
-    timeout: 600
 
   - id: export_results
     type: script
