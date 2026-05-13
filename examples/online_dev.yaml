@@ -59,7 +59,8 @@ steps:
     type: script
     description: "编译验证"
     depends_on: [code_development]
-    command: "cd {{ config.work_dir }} && npm run build 2>&1"
+    command: "npm run build"
+    cwd: "{{ config.work_dir }}"
     on_failure:
       action: goto
       target: compile_failure_analysis    # ← 回退到分析节点

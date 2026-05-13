@@ -10,7 +10,7 @@ steps:
   - id: start_jupyter
     type: script
     description: "确认 Jupyter 可连接"
-    command: "curl -s http://localhost:8888/api/kernels | python3 -c 'import sys,json; print(len(json.load(sys.stdin)), \"kernel(s) running\")'"
+    command: "python -c \"import urllib.request,json; r=urllib.request.urlopen('http://localhost:8888/api/kernels'); print(len(json.load(r)), 'kernel(s) running')\""
 
   - id: data_analysis
     type: llm
@@ -52,4 +52,4 @@ steps:
     type: script
     description: "导出结果"
     depends_on: [data_analysis]
-    command: "python3 -c 'print(\"Results exported.\")'"
+    command: "python -c 'print(\"Results exported.\")'"

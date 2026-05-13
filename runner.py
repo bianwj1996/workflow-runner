@@ -184,6 +184,34 @@ def build_agent_options(step: dict, ctx: dict, system_prompt: str, base_dir: Pat
 
 # ── Script step executor ───────────────────────────────────────
 def run_script(step: dict, ctx: dict, base_dir: Path) -> dict:
+    """Execute a script step.
+
+    Two modes:
+      script: "module:function"  → import and call Python function directly
+      command: "..."             → subprocess (backwards compat, avoid if possible)
+    """
+    # ── Python direct call (preferred) ──
+    if "script" in step:
+        spec = render(step["script"], ctx)  # e.g. "startup_jupyter:start"
+        if ":" in spec:
+            module_path, func_name = spec.rsplit(":", 1)
+        else:
+            module_path, func_name = spec, "run"
+
+        import importlib
+        saved = sys.path.copy()
+        sys.path.insert(0, str(base_dir))
+        try:
+            module = importlib.import_module(module_path)
+            func = getattr(module, func_name)
+            result = func(ctx)
+            if isinstance(result, dict):
+                return result
+            return {"status": "ok", "output": str(result) if result is not None else ""}
+        finally:
+            sys.path = saved
+
+    # ── Subprocess (fallback) ──
     cmd = render(step["command"], ctx)
     cwd = step.get("cwd")
     if cwd:
@@ -193,15 +221,28 @@ def run_script(step: dict, ctx: dict, base_dir: Path) -> dict:
     timeout = step.get("timeout", 300)
 
     try:
-        proc = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True,
-            cwd=cwd, timeout=timeout,
+        import shlex
+        args = shlex.split(cmd)
+        proc = subprocess.Popen(
+            args, shell=False, text=True,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
         )
+        output_lines: list[str] = []
+        assert proc.stdout
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                print(f"    {line}")
+            output_lines.append(line)
+        proc.wait(timeout=timeout)
         return {
             "status": "ok" if proc.returncode == 0 else "failed",
             "returncode": proc.returncode,
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
+            "stdout": "\n".join(output_lines),
+            "stderr": "",
         }
     except subprocess.TimeoutExpired:
         return {"status": "failed", "error": f"timeout after {timeout}s"}
@@ -246,12 +287,13 @@ def run_approval(step: dict, ctx: dict, auto_yes: bool, base_dir: Path) -> dict:
 
 # ── Main runner ────────────────────────────────────────────────
 class WorkflowRunner:
-    def __init__(self, config_path: str, auto_yes: bool = False, dry_run: bool = False):
+    def __init__(self, config_path: str, auto_yes: bool = False, dry_run: bool = False, verbose: bool = False):
         self.config_path = Path(config_path).resolve()
         self.base_dir = self.config_path.parent  # all relative paths resolve from YAML's directory
         self.config = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
         self.auto_yes = auto_yes
         self.dry_run = dry_run
+        self.verbose = verbose
         self.state_path = Path(config_path).with_suffix(".state.json")
         self.state: dict = {"steps": {}, "meta": {}}
         self.ctx: dict = {}
@@ -259,6 +301,12 @@ class WorkflowRunner:
         # Session management
         self._client: ClaudeSDKClient | None = None
         self._session_label: str = ""
+
+        # Approval routing: when set, _next_ready_step checks this step first
+        self._preferred_next: str | None = None
+
+        if self.verbose:
+            self._dump_init()
 
     def run(self, inputs: dict, resume_from: str | None = None):
         try:
@@ -269,6 +317,23 @@ class WorkflowRunner:
                     asyncio.run(self._client.disconnect())
                 except Exception:
                     pass
+
+    def _dump_init(self):
+        """Print all init-time variables for debugging."""
+        import pprint
+        pp = pprint.PrettyPrinter(indent=2, width=120)
+        print(f"\n{'='*60}")
+        print("[DEBUG] WorkflowRunner.__init__")
+        print(f"  config_path : {self.config_path}")
+        print(f"  base_dir    : {self.base_dir}")
+        print(f"  state_path  : {self.state_path}")
+        print(f"  state_path exists: {self.state_path.exists()}")
+        print(f"  auto_yes    : {self.auto_yes}")
+        print(f"  dry_run     : {self.dry_run}")
+        print(f"  state       : {json.dumps(self.state, indent=2, ensure_ascii=False)}")
+        print(f"\n  --- config (YAML) ---")
+        pp.pprint(self.config)
+        print(f"{'='*60}\n")
 
     # ── Session management ──────────────────────────────────
 
@@ -445,6 +510,12 @@ class WorkflowRunner:
             step = self._next_ready_step(executed)
             if step is None:
                 print("\n[OK] All steps completed.")
+                if self._client:
+                    try:
+                        await self._client.disconnect()
+                    except Exception:
+                        pass
+                    self._client = None
                 break
 
             print(f"\n{'='*60}")
@@ -485,15 +556,23 @@ class WorkflowRunner:
             print(f"[OK] [{step['id']}] OK")
             executed.add(step["id"])
 
+            # Approval routing
             if step["type"] == "approval" and result.get("next"):
                 next_step = result["next"]
                 if next_step != "archive":
                     print(f"-> route to: {next_step}")
                     executed.discard(next_step)
                     executed = self._clear_downstream(next_step, executed)
-                    # Also clear the approval itself so it can re-run after the fix chain
-                    executed.discard(step["id"])
-                    executed = self._clear_downstream(step["id"], executed)
+                    self._preferred_next = next_step
+
+            # Success goto (loop-back after normal completion)
+            goto_target = step.get("goto")
+            if goto_target and not result.get("skip_goto"):
+                print(f"-> goto: {goto_target}")
+                executed.discard(goto_target)
+                executed = self._clear_downstream(goto_target, executed)
+                # Also clear this step itself so it can re-run if looped back to
+                executed.discard(step["id"])
 
         if iteration >= max_iterations:
             print("[FAIL] Max iterations reached, possible infinite loop.")
@@ -502,6 +581,16 @@ class WorkflowRunner:
     # ── DAG helpers ──────────────────────────────────────────
 
     def _next_ready_step(self, executed: set[str]) -> dict | None:
+        # If approval routing set a preferred next step, check it first
+        if self._preferred_next:
+            for step in self.config["steps"]:
+                if step["id"] == self._preferred_next:
+                    deps = step.get("depends_on", [])
+                    if all(d in executed for d in deps) and step["id"] not in executed:
+                        self._preferred_next = None
+                        return step
+                    break  # preferred step found but not ready, don't return others yet
+        # Standard top-down search
         for step in self.config["steps"]:
             if step["id"] in executed:
                 continue
@@ -553,6 +642,7 @@ def main():
     parser.add_argument("--yes", action="store_true", help="Auto-approve all approval nodes")
     parser.add_argument("--dry-run", action="store_true", help="Show steps without executing")
     parser.add_argument("--no-state", action="store_true", help="Don't save state on success")
+    parser.add_argument("--verbose", action="store_true", help="Debug: dump all variables at init")
 
     args = parser.parse_args()
 
@@ -560,7 +650,7 @@ def main():
     for k, v in args.input:
         inputs[k] = v
 
-    runner = WorkflowRunner(args.workflow, auto_yes=args.yes, dry_run=args.dry_run)
+    runner = WorkflowRunner(args.workflow, auto_yes=args.yes, dry_run=args.dry_run, verbose=args.verbose)
 
     if args.state:
         runner.state_path = Path(args.state)

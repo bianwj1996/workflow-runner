@@ -8,9 +8,9 @@ Unlike prompt-based workflow tools that rely on the LLM "remembering" to follow 
 
 - **YAML-driven** — define workflows as config, not code
 - **Hard-constraint DAG** — Python enforces execution order, not LLM "自觉"
-- **Python-level loops** — `on_failure: goto` jumps back to any upstream node
-- **Fresh context per step** — each LLM step is a new `claude-agent-sdk` session
-- **Human-in-the-loop** — approval nodes with file preview and choice routing
+- **Python-level loops** — `goto` jumps back to any node on success; `on_failure: goto` on failure
+- **Human-in-the-loop** — approval nodes with file preview and choice routing, route to any step
+- **Fresh context per step** — each LLM step can be `session: shared` (default) or `session: new`
 - **State persistence** — resume from any step after interruption
 - **Portable skills** — `skill_dir/SKILL.md` + `README.md`, copy-and-use
 
@@ -39,13 +39,136 @@ workflow.yaml          skill/SKILL.md        scripts/*.sh
                   Agent   Cmd   Input
 ```
 
+## Execution Engine
+
+The runner's core is a single `while` loop that repeatedly picks the next ready step
+from the DAG until no more steps are eligible or the max-iteration guard trips.
+
+### Main Loop
+
+```
+while iteration < max_iterations:
+    step = _next_ready_step(executed)   -- pick first ready step (see below)
+    if step is None → break (all done)
+
+    result = await _execute_step(step)  -- dispatch by step.type
+
+    if result == "failed":
+        if step has on_failure: goto → clear target + downstream, loop again
+        else: exit(1)
+
+    executed.add(step.id)
+
+    if step.type == "approval" and result.next:
+        handle_approval_routing()       -- set preferred_next, don't clear self
+
+    if step.goto and not result.skip_goto:
+        handle_goto()                   -- clear target + downstream, loop again
+```
+
+### Step Selection (`_next_ready_step`)
+
+Steps are scanned **in YAML definition order**. For each step, if it's not yet in
+`executed` AND all its `depends_on` steps are in `executed`, it's "ready" and
+returned immediately.
+
+```
+for step in workflow.steps (top-down):
+    if step.id in executed → skip
+    if all(step.depends_on) in executed → return step
+return None
+```
+
+**`_preferred_next` priority:** when an approval step routes to a `next` step,
+`_preferred_next` is set to that step's ID. On the next iteration,
+`_next_ready_step` checks the preferred step FIRST (returning it if ready) before
+falling through to normal top-down search. This ensures approval routing takes
+precedence over definition order.
+
+### Approval Routing
+
+When a `type: approval` step returns a `next` field (from user's choice):
+
+```
+result = {status: "ok", choice: "驳回", next: "write_feedback"}
+
+→ executed.discard(next_step)          # un-mark the target so it can run
+→ clear_downstream(next_step)          # un-mark everything that depends on it
+→ _preferred_next = next_step          # prioritize this step next iteration
+```
+
+**Crucially, the approval step itself is NOT cleared from `executed`.** This way:
+- If `next` is a downstream step like `stop_jupyter` (which `depends_on` the
+  approval), the dep IS satisfied → stop_jupyter runs.
+- If `next` is a loop-back step like `write_feedback` (which also depends on the
+  approval), it also runs. Then its `goto` is responsible for unwinding the
+  downstream chain (see next section).
+
+Without this design, clearing the approval step would make downstream steps
+unsatisfied, while the step *before* the approval (whose deps are still met)
+would be picked again → infinite loop.
+
+### Goto (Loop-back)
+
+When a step has `goto: <target>`, after the step succeeds:
+
+```
+executed.discard(goto_target)          # un-mark the jump target
+clear_downstream(goto_target)          # un-mark everything downstream of target
+executed.discard(step.id)              # un-mark the goto step itself
+```
+
+The key detail is `_clear_downstream(goto_target)`, NOT
+`_clear_downstream(step.id)`. Clearing the **target's** downstream ensures that
+when jumping back to `draw_chart`, all later steps (`review`, `write_feedback`,
+`stop_jupyter`) are also cleared so the entire chain re-executes.
+
+### `skip_goto` Flag
+
+A script step can return `{"status": "ok", "skip_goto": true}` to suppress its
+own `goto`. This is used when a step is reached by normal DAG ordering (not
+explicit routing) and should quietly pass through.
+
+Example: `write_feedback` has `depends_on: [review]` and `goto: draw_chart`.
+After the user approves and `stop_jupyter` completes, `write_feedback` becomes
+ready by DAG order. It checks that `review.choice != "驳回"`, returns `skip_goto`,
+and the workflow ends cleanly instead of looping back.
+
+### State & Cleanup
+
+Each step's result is saved to `<workflow>.state.json` immediately after
+execution. The `_clear_downstream(id)` function transitively removes all steps
+that depend on `id` (directly or indirectly) from `executed`. This is used by
+approval routing, goto, and failure handling to rewind the DAG.
+
+When all steps complete, the MCP client is disconnected on the same event loop
+before `break`, avoiding "unclosed transport" warnings on Windows.
+
+### Max Iterations Guard
+
+```
+max_iterations = len(steps) × 10
+```
+
+If the loop exceeds this threshold (e.g. a misconfigured goto creating an
+infinite cycle), the runner exits with an error instead of hanging.
+
 ## Step Types
 
 | type | description | key fields |
 |------|-------------|------------|
-| `llm` | Fresh Claude agent session | `skill_dir`, `user_prompt`, `agent`, `output.save_to` |
-| `script` | Shell command | `command`, `on_failure` |
-| `approval` | Human confirmation | `message`, `show_file`, `choices` |
+| `llm` | Claude agent session | `skill_dir`, `user_prompt`, `agent`, `output.save_to`, `retry` |
+| `script` | Python func (`script: mod:fn`) or subprocess (`command: "..."`) | `script` / `command`, `goto`, `on_failure` |
+| `approval` | Human confirmation with choice routing | `message`, `show_file`, `choices[].next` |
+
+### Script Step: Return Flags
+
+A `type: script` function can include these keys in its return dict:
+
+| flag | effect |
+|------|--------|
+| `skip_goto: true` | Suppress the step's `goto`, even if configured. Use when the step was reached by DAG order (not routing) and should pass through. |
+| `status: "failed"` | Trigger `on_failure` handling (goto / abort). |
 
 ## Workflow YAML Structure
 
