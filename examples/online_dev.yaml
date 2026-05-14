@@ -1,9 +1,8 @@
 name: "在线代码开发"
-version: "1.0"
 
 context:
   work_dir: "./project"
-  model: "claude-sonnet-4-6"
+  max_iterations: 50
 
 steps:
 
@@ -15,6 +14,11 @@ steps:
     user_prompt: |
       请分析以下需求，产出规格文档：
       {{ input.task }}
+      {% if steps.requirement_feedback is defined and steps.requirement_feedback.output %}
+      人工修改意见：
+      {{ steps.requirement_feedback.output }}
+      {% endif %}
+    retry: 2
     output:
       save_to: "{{ config.work_dir }}/specs/analysis.md"
 
@@ -30,96 +34,85 @@ steps:
     show_file: "{{ config.work_dir }}/specs/analysis.md"
     choices:
       - label: "通过，开始开发"
-      - label: "驳回，重新分析"
-        next: requirement_analysis
+      - label: "驳回，给出意见"
+
+  # ── 需求修改意见 ──
+  - id: requirement_feedback
+    type: script
+    description: "提供修改意见（需求分析驳回时）"
+    depends_on: [human_review]
+    script: "scripts.requirement_feedback:handle"
+    goto: requirement_analysis
 
   # ── 代码开发 ──
   - id: code_development
     type: llm
     description: "按规格实现代码"
-    depends_on: [human_review]
+    depends_on: [requirement_feedback]
     agent:
-      permission_mode: "acceptEdits"      # 允许直接写文件
+      permission_mode: "acceptEdits"
       allowed_tools: [Read, Write, Edit, Bash, Glob, Grep]
     skill_dir: "code_development"
     user_prompt: |
-      根据以下规格实现代码：
+      根据以下规格实现代码。请使用 Write 工具在当前工作目录下创建文件，不要只描述或粘贴代码。
 
       {{ steps.requirement_analysis.output }}
+
+      {% if steps.review_feedback is defined and steps.review_feedback.output %}
+      人工修改意见：
+      {{ steps.review_feedback.output }}
+      {% endif %}
+      {% if steps.compile_check is defined and steps.compile_check.status == 'failed' %}
+      编译失败，请修复以下错误后重新编译：
+      {{ steps.compile_check.stderr }}
+      {% endif %}
     output:
-      save_to: "{{ config.work_dir }}/src/"
+      save_to: "{{ config.work_dir }}/specs/implementation_log.md"
 
-  # ════════════════════════════════════════════════════════════
-  #  编译─修复 循环 (Python-level loop)
-  #  compile → 失败 → analyze → compile → 失败 → analyze → ...
-  #  直到编译通过，才进入冒烟测试
-  # ════════════════════════════════════════════════════════════
-
+  # ── 编译验证 ──
   - id: compile_check
     type: script
     description: "编译验证"
     depends_on: [code_development]
-    command: "npm run build"
+    command: "python -m compileall -q ."
     cwd: "{{ config.work_dir }}"
+    timeout: 120
     on_failure:
       action: goto
-      target: compile_failure_analysis    # ← 回退到分析节点
-
-  - id: compile_failure_analysis
-    type: llm
-    description: "分析编译失败原因并修复代码"
-    skill_dir: "failure_analysis"
-    user_prompt: |
-      编译失败，错误信息：
-
-      {{ steps.compile_check.stderr }}
-
-      请分析原因并给出修复后的代码。
-    output:
-      save_to: "{{ config.work_dir }}/specs/fix_plan.md"
-    # 没有 depends_on —— 只通过 on_failure: goto 到达
-    # 执行完毕后 compile_check 自动变为 ready（依赖的 code_development 已满足）
+      target: code_development
 
   # ── 冒烟测试 ──
   - id: smoke_test
     type: script
     description: "冒烟测试"
-    depends_on: [compile_check]            # ← 编译通过后才执行
-    command: "./examples/scripts/smoke_test.sh {{ config.work_dir }}"
-
-  # ── 上线部署 ──
-  - id: deploy
-    type: script
-    description: "上线部署"
-    depends_on: [smoke_test]
-    command: "./examples/scripts/deploy.sh {{ config.work_dir }}"
+    depends_on: [compile_check]
+    command: "python main.py"
+    cwd: "{{ config.work_dir }}"
+    timeout: 30
 
   # ── 代码审查 (独立 agent，只读) ──
   - id: code_review
     type: llm
     description: "AI 代码审查 — 独立 agent session，只读权限"
-    depends_on: [deploy]
+    depends_on: [smoke_test]
     agent:
-      session: new                        # 独立 session，看不到开发历史
-      model: "claude-sonnet-4-6"
-      permission_mode: "plan"             # 只读模式
-      allowed_tools: [Read, Grep, Glob]   # 只能读
+      session: new
+      permission_mode: "plan"
+      allowed_tools: [Read, Grep, Glob]
       max_turns: 15
     skill_dir: "code_review"
     user_prompt: |
-      审查以下改动。需求规格：
+      只审查 {{ config.work_dir }} 目录下的源代码文件（.py），不要读取工作流配置（.yaml）、skills 或 scripts 目录。
+
+      需求规格：
 
       {{ steps.requirement_analysis.output }}
 
-      请产出 CR 报告，列出问题和建议。
+      产出 CR 报告，列出问题和建议。
     output:
       save_to: "{{ config.work_dir }}/specs/cr_report.md"
 
-  # ════════════════════════════════════════════════════════════
-  #  CR 驳回 → 重新开发 循环 (Python-level loop)
-  #  CR 不通过 → 回到代码开发 → 编译 → 冒烟 → 部署 → 再 CR
-  # ════════════════════════════════════════════════════════════
-
+  # ── CR 确认 ──
   - id: cr_approval
     type: approval
     description: "确认 CR 结果"
@@ -128,6 +121,27 @@ steps:
       CR 完成。报告: {{ config.work_dir }}/specs/cr_report.md
     show_file: "{{ config.work_dir }}/specs/cr_report.md"
     choices:
-      - label: "通过，归档"
+      - label: "通过，上线部署"
       - label: "驳回，重新开发"
-        next: code_development               # ← 回退到开发节点，触发完整重跑
+
+  # ════════════════════════════════════════════════════════════
+  #  修改意见 → 重新开发 循环 (Python-level loop)
+  #  CR 驳回 → 输入意见 → goto code_development → 编译 → 冒烟 → CR
+  #  CR 通过 → skip_goto → 上线
+  # ════════════════════════════════════════════════════════════
+
+  - id: review_feedback
+    type: script
+    description: "提供修改意见（CR 驳回时）"
+    depends_on: [cr_approval]
+    script: "scripts.review_feedback:handle"
+    goto: code_development
+
+  # ── 上线部署 ──
+  - id: deploy
+    type: script
+    description: "上线部署"
+    depends_on: [review_feedback]
+    command: "python -c \"print('deploy complete')\""
+    cwd: "{{ config.work_dir }}"
+    timeout: 10

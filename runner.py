@@ -301,6 +301,8 @@ class WorkflowRunner:
         # Session management
         self._client: ClaudeSDKClient | None = None
         self._session_label: str = ""
+        self._shared_client: ClaudeSDKClient | None = None  # main session, survives new/tmp steps
+        self._shared_label: str = ""
 
         # Approval routing: when set, _next_ready_step checks this step first
         self._preferred_next: str | None = None
@@ -340,18 +342,17 @@ class WorkflowRunner:
     async def _ensure_client(self, step: dict) -> ClaudeSDKClient:
         """Get or create the ClaudeSDKClient for this step.
 
-        session: "shared" (default) — reuse existing client, preserve history
-        session: "new"            — disconnect old, create fresh isolated client
+        session: "shared" (default) — reuse main persistent session, preserve history
+        session: "new"            — temp isolated session, destroyed after step; main session restored
         """
         session_mode = step.get("agent", {}).get("session", "shared")
         skill = read_skill(step, self.ctx, self.base_dir)
 
         if session_mode == "new":
-            # Tear down shared session if any
-            if self._client:
-                await self._client.disconnect()
-                self._client = None
-                self._session_label = ""
+            # Remember the main shared session before switching to temp
+            if self._shared_client is None and self._client is not None:
+                self._shared_client = self._client
+                self._shared_label = self._session_label
 
             step_label = f"{step['id']} (isolated)"
             print(f"  [NEW] isolated session: {step_label}")
@@ -361,13 +362,21 @@ class WorkflowRunner:
             self._session_label = step_label
             return self._client
 
-        # session: shared — reuse or create shared session
+        # session: shared — reuse or create main persistent session
+        if self._shared_client is not None:
+            self._client = self._shared_client
+            self._session_label = self._shared_label
+            print(f"  [SHARED] session: {step['id']} (cont from {self._session_label})")
+            return self._shared_client
+
         if self._client is None:
             print(f"  [SHARED] session: {step['id']} (first LLM step)")
             options = build_agent_options(step, self.ctx, skill, self.base_dir)
             self._client = ClaudeSDKClient(options=options)
             await self._client.connect()
             self._session_label = "shared"
+            self._shared_client = self._client
+            self._shared_label = "shared"
         else:
             print(f"  [SHARED] session: {step['id']} (cont from {self._session_label})")
 
@@ -380,85 +389,97 @@ class WorkflowRunner:
         client = await self._ensure_client(step)
         session_mode = step.get("agent", {}).get("session", "shared")
 
-        if session_mode == "new":
-            # Isolated session: skill = system_prompt, user_prompt = task only
-            user_message = render(step["user_prompt"], self.ctx)
-        else:
-            # Shared session: skill goes into user message as step instructions
-            user_message = render(
-                "## Step Instructions\n\n"
-                f"{skill}\n\n"
-                "## Task\n\n"
-                f"{render(step['user_prompt'], self.ctx)}",
-                self.ctx,
-            )
+        try:
+            if session_mode == "new":
+                # Isolated session: skill = system_prompt, user_prompt = task only
+                user_message = render(step["user_prompt"], self.ctx)
+            else:
+                # Shared session: skill goes into user message as step instructions
+                user_message = render(
+                    "## Step Instructions\n\n"
+                    f"{skill}\n\n"
+                    "## Task\n\n"
+                    f"{render(step['user_prompt'], self.ctx)}",
+                    self.ctx,
+                )
 
-        agent_cfg = step.get("agent", {})
-        model = agent_cfg.get("model") or step.get("model") or self.config.get("context", {}).get("model")
-        retries = step.get("retry", 0) + 1
-        all_text: list[str] = []
-        usage_info: dict[str, Any] = {}
-        cost = 0.0
-        duration_ms = 0
-        final_subtype = ""
-        last_output = ""
+            agent_cfg = step.get("agent", {})
+            model = agent_cfg.get("model") or step.get("model") or self.config.get("context", {}).get("model")
+            retries = step.get("retry", 0) + 1
+            all_text: list[str] = []
+            usage_info: dict[str, Any] = {}
+            cost = 0.0
+            duration_ms = 0
+            final_subtype = ""
+            last_output = ""
 
-        for attempt in range(retries):
-            try:
-                all_text = []
-                await client.query(user_message)
+            for attempt in range(retries):
+                try:
+                    all_text = []
+                    await client.query(user_message)
 
-                async for message in client.receive_response():
-                    if isinstance(message, AssistantMessage):
-                        for block in message.content:
-                            if isinstance(block, TextBlock):
-                                all_text.append(block.text)
-                            elif isinstance(block, ToolUseBlock):
-                                print(f"  [TOOL] {block.name}({json.dumps(block.input, ensure_ascii=False)[:120]})")
-                            elif isinstance(block, ThinkingBlock):
-                                print(f"  [THINK] {block.thinking[:200]}...")
+                    async for message in client.receive_response():
+                        if isinstance(message, AssistantMessage):
+                            for block in message.content:
+                                if isinstance(block, TextBlock):
+                                    all_text.append(block.text)
+                                elif isinstance(block, ToolUseBlock):
+                                    print(f"  [TOOL] {block.name}({json.dumps(block.input, ensure_ascii=False)[:120]})")
+                                elif isinstance(block, ThinkingBlock):
+                                    print(f"  [THINK] {block.thinking[:200]}...")
 
-                    elif isinstance(message, ResultMessage):
-                        cost = message.total_cost_usd or 0
-                        duration_ms = message.duration_ms or 0
-                        final_subtype = message.subtype or ""
-                        if message.usage:
-                            usage_info = message.usage
-                        if message.is_error:
-                            raise RuntimeError(
-                                f"Agent error: {message.errors}, subtype={message.subtype}"
-                            )
+                        elif isinstance(message, ResultMessage):
+                            cost = message.total_cost_usd or 0
+                            duration_ms = message.duration_ms or 0
+                            final_subtype = message.subtype or ""
+                            if message.usage:
+                                usage_info = message.usage
+                            if message.is_error:
+                                raise RuntimeError(
+                                    f"Agent error: {message.errors}, subtype={message.subtype}"
+                                )
 
-                combined_text = "\n".join(all_text)
-                last_output = combined_text
+                    combined_text = "\n".join(all_text)
+                    last_output = combined_text
 
-                save_path = step.get("output", {}).get("save_to")
-                if save_path:
-                    dst = resolve_path(render(save_path, self.ctx | {"_last_output": combined_text}), self.base_dir)
-                    Path(dst).parent.mkdir(parents=True, exist_ok=True)
-                    Path(dst).write_text(combined_text, encoding="utf-8")
+                    save_path = step.get("output", {}).get("save_to")
+                    if save_path:
+                        dst = resolve_path(render(save_path, self.ctx | {"_last_output": combined_text}), self.base_dir)
+                        Path(dst).parent.mkdir(parents=True, exist_ok=True)
+                        Path(dst).write_text(combined_text, encoding="utf-8")
 
-                if final_subtype == "error_during_execution":
-                    raise RuntimeError(f"Agent ended with error: {combined_text[-500:]}")
+                    if final_subtype == "error_during_execution":
+                        raise RuntimeError(f"Agent ended with error: {combined_text[-500:]}")
 
-                return {
-                    "status": "ok",
-                    "output": combined_text,
-                    "model": model or "default",
-                    "cost_usd": cost,
-                    "duration_ms": duration_ms,
-                    "usage": usage_info,
-                    "subtype": final_subtype,
-                }
+                    return {
+                        "status": "ok",
+                        "output": combined_text,
+                        "model": model or "default",
+                        "cost_usd": cost,
+                        "duration_ms": duration_ms,
+                        "usage": usage_info,
+                        "subtype": final_subtype,
+                    }
 
-            except Exception as e:
-                if attempt < retries - 1:
-                    print(f"  [RETRY] Attempt {attempt + 1} failed: {e}, retrying...")
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-                return {"status": "failed", "error": str(e), "output": last_output}
+                except Exception as e:
+                    if attempt < retries - 1:
+                        print(f"  [RETRY] Attempt {attempt + 1} failed: {e}, retrying...")
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    return {"status": "failed", "error": str(e), "output": last_output}
 
-        return {"status": "failed", "error": "max retries exceeded"}
+            return {"status": "failed", "error": "max retries exceeded"}
+
+        finally:
+            if session_mode == "new":
+                await self._client.disconnect()
+                if self._shared_client is not None:
+                    self._client = self._shared_client
+                    self._session_label = self._shared_label
+                    print(f"  [SESSION] restored main session")
+                else:
+                    self._client = None
+                    self._session_label = ""
 
     # ── Step dispatch ────────────────────────────────────────
 
@@ -502,7 +523,7 @@ class WorkflowRunner:
             }
 
         self._save_state()
-        max_iterations = len(self.config["steps"]) * 10
+        max_iterations = self.config.get("context", {}).get("max_iterations") or len(self.config["steps"]) * 10
         iteration = 0
 
         while iteration < max_iterations:

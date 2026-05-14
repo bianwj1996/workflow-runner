@@ -14,13 +14,28 @@ Unlike prompt-based workflow tools that rely on the LLM "remembering" to follow 
 - **State persistence** — resume from any step after interruption
 - **Portable skills** — `skill_dir/SKILL.md` + `README.md`, copy-and-use
 
-## Quick Start
+## Installation
+
+```bash
+# Dev mode (recommended) — edit runner.py without reinstalling
+pip install -e .
+
+# Prod mode — install into site-packages
+pip install .
+```
+
+Once installed, use the `wfr` or `workflow-runner` command:
+
+```bash
+# Quick test
+cd examples
+wfr -w online_dev.yaml -t "用python写一个hello world"
+```
+
+Or just install dependencies and run directly with python:
 
 ```bash
 pip install -r requirements.txt
-```
-
-```bash
 python3 runner.py -w examples/online_dev.yaml -t "开发用户登录功能"
 ```
 
@@ -170,7 +185,139 @@ A `type: script` function can include these keys in its return dict:
 | `skip_goto: true` | Suppress the step's `goto`, even if configured. Use when the step was reached by DAG order (not routing) and should pass through. |
 | `status: "failed"` | Trigger `on_failure` handling (goto / abort). |
 
-## Workflow YAML Structure
+## YAML Reference
+
+### Top-level fields
+
+| field | required | type | description |
+|-------|----------|------|-------------|
+| `name` | no | string | Human-readable workflow name |
+| `context` | no | dict | Default settings for all steps (see below) |
+| `steps` | **yes** | list | Ordered list of step definitions |
+
+### Context fields
+
+Nested under `context:`.
+
+| field | required | type | default | description |
+|-------|----------|------|---------|-------------|
+| `work_dir` | no | string | `os.getcwd()` | Default working directory for all steps |
+| `model` | no | string | — | Default Claude model for all LLM steps |
+| `max_iterations` | no | int | `steps × 10` | Max loop iterations before aborting (safety guard) |
+
+All context keys are available in templates as `{{ config.<key> }}`.
+
+### Step fields (all types)
+
+| field | required | type | default | description |
+|-------|----------|------|---------|-------------|
+| `id` | **yes** | string | — | Unique step identifier |
+| `type` | **yes** | string | — | `llm` / `script` / `approval` |
+| `description` | no | string | `id` | Human-readable label for logging |
+| `depends_on` | no | list[string] | `[]` | Step IDs that must complete before this one |
+| `goto` | no | string | — | Step ID to jump to after success (unless `skip_goto`) |
+| `cwd` | no | string | `context.work_dir` | Working directory for this step |
+| `timeout` | no | int | `300` | Timeout in seconds (script steps only) |
+| `on_failure` | no | dict | — | Failure handler (see below) |
+
+Agent-related step fields (also settable under `agent:` which overrides these):
+
+| field | type | default | description |
+|-------|------|---------|-------------|
+| `model` | string | `context.model` | Claude model |
+| `permission_mode` | string | `"default"` | `default` / `acceptEdits` / `plan` / `bypassPermissions` |
+| `max_turns` | int | — | Max tool-calling round-trips |
+| `allowed_tools` | list[string] | `[Read, Write, Edit, Bash, Glob, Grep]` | Allowed tool names |
+| `disallowed_tools` | list[string] | `[]` | Disallowed tool names |
+| `thinking` | bool | — | Extended thinking toggle |
+| `mcp_servers` | dict | — | MCP server config (see below) |
+
+### LLM step (`type: llm`)
+
+| field | required | type | description |
+|-------|----------|------|-------------|
+| `skill_dir` | * | string | Skill name or path. Bare name searches `~/.claude/skills/`, `<project>/.claude/skills/`, `<project>/skills/` in order |
+| `system_prompt` | * | string | Inline system prompt text |
+| `system_prompt_file` | * | string | Path to system prompt file (relative to YAML) |
+| `user_prompt` | **yes** | string | Main user message (Jinja2 template) |
+| `retry` | no | int | Retry count on failure (default: `0`) |
+| `output` | no | dict | Output config (see below) |
+
+\* Exactly one of `skill_dir`, `system_prompt`, or `system_prompt_file` is required.
+
+### Script step (`type: script`)
+
+| field | required | type | description |
+|-------|----------|------|-------------|
+| `script` | * | string | `"module:function"` — direct Python call |
+| `command` | * | string | Shell command string |
+| `timeout` | no | int | Command timeout in seconds (default: `300`) |
+
+\* `script` takes priority. One of the two is required.
+
+A script function can return flags: `skip_goto: true` suppresses the step's `goto`; `status: "failed"` triggers `on_failure` handling.
+
+### Approval step (`type: approval`)
+
+| field | required | type | default | description |
+|-------|----------|------|---------|-------------|
+| `message` | no | string | `"Proceed?"` | Prompt shown to user (Jinja2 template) |
+| `show_file` | no | string | — | File path to display before the prompt |
+| `choices` | no | list[dict] | y/n | Named choices (see below) |
+
+### Agent fields
+
+Nested under `agent:`. All fields here override the step-level equivalents.
+
+| field | type | default | description |
+|-------|------|---------|-------------|
+| `session` | string | `"shared"` | `"shared"` (reuse agent session) or `"new"` (isolated session) |
+| `model` | string | step `model` | Claude model |
+| `permission_mode` | string | step `permission_mode` | Permission mode |
+| `max_turns` | int | step `max_turns` | Max tool-calling rounds |
+| `allowed_tools` | list[string] | step `allowed_tools` | Allowed tools |
+| `disallowed_tools` | list[string] | step `disallowed_tools` | Disallowed tools |
+| `thinking` | bool | step `thinking` | Extended thinking |
+| `cwd` | string | step `cwd` | Working directory |
+| `mcp_servers` | dict | step `mcp_servers` | MCP server config |
+
+### MCP servers
+
+Nested under `mcp_servers:` (or `agent.mcp_servers:`). Each key is a server name.
+
+| field | required | type | description |
+|-------|----------|------|-------------|
+| `command` | **yes** | string | MCP server executable |
+| `args` | no | list[string] | Command-line arguments |
+| `env` | no | dict | Environment variables (values are Jinja2-templated) |
+
+### Output
+
+Nested under `output:` on LLM steps.
+
+| field | required | type | description |
+|-------|----------|------|-------------|
+| `save_to` | **yes** | string | File path to write LLM output (Jinja2 template, `_last_output` available) |
+
+### Choices
+
+Nested under `choices:` on approval steps. Each item is a dict.
+
+| field | required | type | description |
+|-------|----------|------|-------------|
+| `label` | **yes** | string | Display text for the choice |
+| `next` | no | string | Step ID to route to when chosen |
+
+### On failure
+
+Nested under `on_failure:` on any step.
+
+| field | required | type | description |
+|-------|----------|------|-------------|
+| `action` | **yes** | string | Currently only `"goto"` is supported |
+| `target` | **yes** | string | Step ID to jump to on failure |
+
+### Example
 
 ```yaml
 name: "在线代码开发"
@@ -202,6 +349,18 @@ steps:
       action: goto
       target: failure_analysis      # ← hard-constraint jump
 ```
+
+### Template variables
+
+Available in all Jinja2-templated fields (`user_prompt`, `message`, `command`, `env` values, etc.):
+
+| variable | type | description |
+|----------|------|-------------|
+| `{{ input }}` | dict | CLI inputs: `input.task` from `--task`, plus `-i key value` pairs |
+| `{{ env }}` | dict | All environment variables |
+| `{{ config }}` | dict | The `context:` section contents |
+| `{{ steps }}` | dict | Completed step results by ID: `steps.<id>.output`, `.status`, `.stderr`, etc. |
+| `{{ workflow_dir }}` | string | Absolute path of the YAML file's directory |
 
 ## Skill Resolution
 
@@ -285,19 +444,6 @@ python3 runner.py -w workflow.yaml --resume compile_check
 
 # Dry run
 python3 runner.py -w workflow.yaml -t "xxx" --dry-run
-```
-
-## Template Context
-
-Inside `user_prompt`, `message`, and `command` fields, use Jinja2 templates:
-
-```
-{{ input.task }}                    # CLI --task value
-{{ input.key }}                     # CLI -i key value
-{{ config.work_dir }}              # context.work_dir from YAML
-{{ steps.requirement_analysis.output }}  # previous step output
-{{ steps.compile.stderr }}         # script stderr from previous step
-{{ env.HOME }}                     # environment variables
 ```
 
 ## Hard Constraints vs Soft Prompts
